@@ -302,9 +302,9 @@ tr:hover td{background:#fafafa}
 // ── MoneyCharger キャッシュバック計算 ──
 // レート定義
 const CB_RATES = {
-  Axi:   { 'BTC/USD': 380/100, 'XAU/USD': 6.65 },   // Point÷100=USD
-  Titan: { 'BTC/USD': 192,     'XAU/USD': 0.80  },   // BTC/USDはJPY、XAU/USDはUSD
-  XS:    { 'BTC/USD': 8.00,    'XAU/USD': 7.20  },   // USD
+  Axi:   { 'BTCUSD': 380/100, 'XAUUSD': 6.65, 'BTC/USD': 380/100, 'XAU/USD': 6.65 },
+  Titan: { 'BTCUSD': 192,     'XAUUSD': 0.80,  'BTC/USD': 192,     'XAU/USD': 0.80  },
+  XS:    { 'BTCUSD': 8.00,    'XAUUSD': 7.20,  'BTC/USD': 8.00,    'XAU/USD': 7.20  },
 };
 
 async function fetchUSDJPY() {
@@ -323,7 +323,7 @@ function calcCB(broker, trades, usdJpy) {
     const rates = CB_RATES[broker];
     if (!rates || !rates[sym]) return;
     const rateUSD = rates[sym];
-    if (broker === 'Titan' && sym === 'BTC/USD') {
+    if (broker === 'Titan' && (sym === 'BTC/USD' || sym === 'BTCUSD')) {
       totalJpy += lot * rateUSD; // すでにJPY
     } else {
       totalJpy += lot * rateUSD * usdJpy;
@@ -337,13 +337,27 @@ const SUPABASE_URL = 'https://ilrawmurrnbpeadrskie.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_X0XqqfH1uw-6pNHRzsrQug_UjLenutw';
 
 async function fetchTrades() {
+  // 3/10以降の全件取得（ページング対応）
+  const startDate = '2026-03-10T00:00:00+00:00';
+  let all = [], offset = 0, limit = 1000;
+  while(true) {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/trades?select=*&closed_at=gte.${startDate}&order=closed_at.asc&limit=${limit}&offset=${offset}`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + SUPABASE_KEY } }
+    );
+    if (!res.ok) break;
+    const rows = await res.json();
+    all = all.concat(rows);
+    if (rows.length < limit) break;
+    offset += limit;
+  }
+  return all;
+}
+
+function isThisMonth(dateStr) {
   const now = new Date();
-  const firstDay = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-  const res = await fetch(
-    `${SUPABASE_URL}/rest/v1/trades?closed_at=gte.${firstDay}&select=*`,
-    { headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + SUPABASE_KEY } }
-  );
-  return res.ok ? res.json() : [];
+  const d = new Date(dateStr);
+  return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth();
 }
 
 async function fetchSnapshots() {
@@ -388,7 +402,7 @@ async function loadData() {
   });
 
   // 全口座合計
-  let totalPnl = 0, totalTrades = 0, totalWin = 0;
+  let totalPnl = 0, totalCumPnl = 0, totalTrades = 0, totalWin = 0;
 
   // 口座ラベルの一覧を取得（Supabaseに実際に入っているラベル）
   const allLabels = [...new Set([
@@ -419,36 +433,53 @@ async function loadData() {
       if (balEl) balEl.textContent = fmtB(snap.balance);
     }
 
-    // 損益・勝率
-    let pnl = 0, wins = 0;
-    labelTrades.forEach(t => {
-      pnl += parseFloat(t.net_profit) || 0;
+    // 今月の取引と全期間の取引を分ける
+    const monthTrades = labelTrades.filter(t => isThisMonth(t.closed_at));
+    const allLabelTrades = labelTrades;
+
+    // 今月損益・勝率（口座カード表示用）
+    let monthPnl = 0, wins = 0;
+    monthTrades.forEach(t => {
+      monthPnl += parseFloat(t.net_profit) || 0;
       if ((parseFloat(t.net_profit) || 0) > 0) wins++;
     });
-    totalPnl += pnl;
-    totalTrades += labelTrades.length;
+
+    // 全期間累計損益
+    let cumPnl = 0;
+    allLabelTrades.forEach(t => { cumPnl += parseFloat(t.net_profit) || 0; });
+
+    totalPnl += monthPnl;
+    totalCumPnl += cumPnl;
+    totalTrades += monthTrades.length;
     totalWin += wins;
 
     const pnlEl = document.getElementById(`${elId}-pnl`);
     const wrEl  = document.getElementById(`${elId}-wr`);
     const lotsEl = document.getElementById(`${elId}-lots`);
-    if (pnlEl) { pnlEl.textContent = fmt(pnl); pnlEl.style.color = pnl >= 0 ? '#ff4d8d' : '#555'; }
-    if (wrEl)  wrEl.textContent = labelTrades.length > 0 ? (wins/labelTrades.length*100).toFixed(1)+'%' : '—';
+    if (pnlEl) { pnlEl.textContent = fmt(monthPnl); pnlEl.style.color = monthPnl >= 0 ? '#ff4d8d' : '#555'; }
+    if (wrEl)  wrEl.textContent = monthTrades.length > 0 ? (wins/monthTrades.length*100).toFixed(1)+'%' : '—';
 
-    // CB計算
-    const totalLots = labelTrades.reduce((s,t) => s + (parseFloat(t.volume)||0), 0);
-    if (lotsEl) lotsEl.textContent = totalLots.toFixed(2) + ' lot';
-    const cb = calcCB(brokerKey, labelTrades.map(t=>({symbol:t.symbol,volume:t.volume})), usdJpy);
+    // CB計算（今月分のみ）
+    const monthLots = monthTrades.reduce((s,t) => s + (parseFloat(t.volume)||0), 0);
+    if (lotsEl) lotsEl.textContent = monthLots.toFixed(2) + ' lot';
+    const cb = calcCB(brokerKey, monthTrades.map(t=>({symbol:t.symbol,volume:t.volume})), usdJpy);
     const cbEl = document.getElementById(`cb-${elId}`);
     if (cbEl) cbEl.textContent = '約 ¥' + cb.toLocaleString();
   });
 
   // 全口座合計カード更新
   const wr = totalTrades > 0 ? (totalWin/totalTrades*100).toFixed(1) : '—';
-  const statVals = document.querySelectorAll('.stat-box .value');
-  if (statVals[0]) { statVals[0].textContent = fmt(totalPnl); }
-  if (statVals[1]) { statVals[1].textContent = wr + '%'; statVals[1].nextElementSibling.textContent = totalWin + '勝 / ' + totalTrades + '取引'; }
-  if (statVals[3]) { statVals[3].textContent = totalTrades; }
+  const elMonth = document.getElementById('stat-month');
+  const elCum   = document.getElementById('stat-cum');
+  const elWr    = document.getElementById('stat-wr');
+  const elWrSub = document.getElementById('stat-wr-sub');
+  const elCount = document.getElementById('stat-count');
+
+  if (elMonth) { elMonth.textContent = fmt(totalPnl); elMonth.style.color = totalPnl >= 0 ? '#ff4d8d' : '#555'; }
+  if (elCum)   { elCum.textContent   = fmt(totalCumPnl); elCum.style.color = totalCumPnl >= 0 ? '#ff4d8d' : '#555'; }
+  if (elWr)    { elWr.textContent    = wr + '%'; }
+  if (elWrSub) { elWrSub.textContent = totalWin + '勝 / ' + totalTrades + '取引'; }
+  if (elCount) { elCount.textContent = totalTrades; }
 
   // 収支グラフ（日別累計）
   const daily = {};
